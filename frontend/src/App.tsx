@@ -14,10 +14,20 @@ import PolicySelector from './components/PolicySelector';
 import BulkCheck from './components/BulkCheck';
 import Dashboard from './components/Dashboard';
 import PolicyBuilder from './components/PolicyBuilder';
+import BreachMonitor from './components/BreachMonitor';
+import TrendsTab from './components/TrendsTab';
+import BreachMap from './components/BreachMap';
+import EntropyCalculator from './components/EntropyCalculator';
+import TeamDashboard from './components/TeamDashboard';
+import ExportAnalyzer from './components/ExportAnalyzer';
+import Gamification from './components/Gamification';
+import ExpiryTracker from './components/ExpiryTracker';
+import DarkWebMonitor from './components/DarkWebMonitor';
 import { usePasswordAnalysis } from './hooks/usePasswordAnalysis';
 import { useI18n } from './i18n';
+import { trackEvent } from './components/Gamification';
 
-type Tab = 'analyzer' | 'generator' | 'passphrase' | 'compare' | 'history' | 'bulk' | 'dashboard' | 'bookmarklet' | 'policyBuilder';
+type Tab = 'analyzer' | 'generator' | 'passphrase' | 'compare' | 'history' | 'bulk' | 'dashboard' | 'bookmarklet' | 'policyBuilder' | 'monitor' | 'trends' | 'breachMap' | 'entropyCalc' | 'teams' | 'exportAnalyzer' | 'gamification' | 'expiryTracker' | 'darkweb';
 
 export default function App() {
   const { t, lang, setLang } = useI18n();
@@ -33,18 +43,27 @@ export default function App() {
   }, [theme]);
 
   const TABS: { id: Tab; label: string; icon: string }[] = [
-    { id: 'analyzer', label: t('tab.analyzer'), icon: '🔍' },
-    { id: 'generator', label: t('tab.generator'), icon: '🎲' },
-    { id: 'passphrase', label: t('tab.passphrase'), icon: '📝' },
-    { id: 'compare', label: t('tab.compare'), icon: '⚖️' },
-    { id: 'bulk', label: t('tab.bulk'), icon: '📦' },
-    { id: 'dashboard', label: t('tab.dashboard'), icon: '📊' },
-    { id: 'history', label: t('tab.history'), icon: '🕐' },
-    { id: 'policyBuilder', label: t('tab.policyBuilder'), icon: '📋' },
-    { id: 'bookmarklet', label: t('tab.bookmarklet'), icon: '🔖' },
+    { id: 'analyzer', label: 'Analyzer', icon: '🔍' },
+    { id: 'generator', label: 'Generator', icon: '🎲' },
+    { id: 'passphrase', label: 'Passphrase', icon: '📝' },
+    { id: 'compare', label: 'Compare', icon: '⚖️' },
+    { id: 'bulk', label: 'Bulk Check', icon: '📦' },
+    { id: 'dashboard', label: 'Dashboard', icon: '📊' },
+    { id: 'trends', label: 'Trends', icon: '📈' },
+    { id: 'entropyCalc', label: 'Entropy', icon: '🧮' },
+    { id: 'monitor', label: 'Monitor', icon: '📧' },
+    { id: 'breachMap', label: 'Breach Map', icon: '🗺️' },
+    { id: 'darkweb', label: 'Dark Web', icon: '🕵️' },
+    { id: 'exportAnalyzer', label: 'Export', icon: '📁' },
+    { id: 'teams', label: 'Teams', icon: '👥' },
+    { id: 'expiryTracker', label: 'Expiry', icon: '⏰' },
+    { id: 'gamification', label: 'Achievements', icon: '🏆' },
+    { id: 'history', label: 'History', icon: '🕐' },
+    { id: 'policyBuilder', label: 'Policy Builder', icon: '📋' },
+    { id: 'bookmarklet', label: 'Bookmarklet', icon: '🔖' },
   ];
 
-  // Save to history when result changes
+  // Save to history and track gamification when result changes
   const lastSavedRef = { current: '' };
   if (result && password && password !== lastSavedRef.current) {
     lastSavedRef.current = password;
@@ -55,6 +74,11 @@ export default function App() {
       length: result.password_length,
       breach_count: result.breach_count,
     });
+    trackEvent('analysis');
+    if (result.strength_percent >= 80) trackEvent('strong_password');
+    if (result.breach_count === 0 && result.breach_checked) trackEvent('no_breaches');
+    if (result.breach_count > 0) trackEvent('breach_found');
+    if (result.policy_compliant && policy) trackEvent('policy_compliant');
   }
 
   const isDark = theme === 'dark';
@@ -88,7 +112,6 @@ export default function App() {
           className="text-center space-y-3"
         >
           <div className="flex items-center justify-between">
-            {/* Language toggle */}
             <div className="flex gap-1">
               {(['en', 'id'] as const).map((l) => (
                 <button
@@ -104,34 +127,31 @@ export default function App() {
                 </button>
               ))}
             </div>
-
-            {/* Theme toggle */}
             <button
               onClick={toggleTheme}
               className={`p-2 rounded-lg transition-all ${isDark ? 'text-slate-400 hover:text-white hover:bg-white/10' : 'text-slate-500 hover:text-slate-800 hover:bg-slate-200'}`}
-              title={isDark ? t('theme.light') : t('theme.dark')}
+              title={isDark ? 'Light' : 'Dark'}
             >
               {isDark ? '☀️' : '🌙'}
             </button>
           </div>
 
           <h1 className={`text-4xl font-bold tracking-tight ${isDark ? 'text-white' : 'text-slate-900'}`}>
-            {t('app.title')}
-            <span className="bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent"> {t('app.titleHighlight')}</span>
+            PW<span className="bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">Guard</span>
           </h1>
           <p className={`text-sm max-w-md mx-auto ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>
-            {t('app.subtitle')}
+            Real-time password strength analyzer with zxcvbn scoring, breach detection, and policy compliance.
           </p>
         </motion.div>
 
         {/* Tab bar */}
-        <div className="flex justify-center overflow-x-auto">
-          <div className={`p-1 flex gap-1 rounded-2xl ${isDark ? 'glass' : 'bg-white/80 backdrop-blur-xl border border-slate-200 shadow-sm'}`}>
+        <div className="flex justify-center overflow-x-auto pb-2">
+          <div className={`p-1 flex gap-1 rounded-2xl flex-wrap justify-center ${isDark ? 'glass' : 'bg-white/80 backdrop-blur-xl border border-slate-200 shadow-sm'}`}>
             {TABS.map((tab) => (
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
-                className={`relative px-3 py-2 rounded-xl text-sm font-medium transition-all flex items-center gap-1.5 whitespace-nowrap ${
+                className={`relative px-2.5 py-1.5 rounded-xl text-xs font-medium transition-all flex items-center gap-1 whitespace-nowrap ${
                   activeTab === tab.id
                     ? isDark ? 'text-white' : 'text-slate-900'
                     : isDark ? 'text-slate-500 hover:text-slate-300' : 'text-slate-400 hover:text-slate-600'
@@ -145,7 +165,7 @@ export default function App() {
                   />
                 )}
                 <span className="relative z-10">{tab.icon}</span>
-                <span className="relative z-10 hidden sm:inline">{tab.label}</span>
+                <span className="relative z-10 hidden lg:inline">{tab.label}</span>
               </button>
             ))}
           </div>
@@ -177,7 +197,7 @@ export default function App() {
                 <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.4 }}
                   className={`p-10 text-center rounded-2xl ${isDark ? 'glass' : 'bg-white/80 backdrop-blur-xl border border-slate-200'}`}>
                   <div className="text-4xl mb-4">🔐</div>
-                  <p className={`text-sm ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>{t('analyzer.enterPassword')}</p>
+                  <p className={`text-sm ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>Enter a password above to see its strength analysis</p>
                 </motion.div>
               )}
             </motion.div>
@@ -185,13 +205,13 @@ export default function App() {
 
           {activeTab === 'generator' && (
             <motion.div key="generator" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
-              <PasswordGenerator onGenerate={() => {}} />
+              <PasswordGenerator onGenerate={() => trackEvent('generator')} />
             </motion.div>
           )}
 
           {activeTab === 'passphrase' && (
             <motion.div key="passphrase" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
-              <PassphraseGenerator onGenerate={() => {}} />
+              <PassphraseGenerator onGenerate={() => trackEvent('passphrase_master')} />
             </motion.div>
           )}
 
@@ -210,6 +230,60 @@ export default function App() {
           {activeTab === 'dashboard' && (
             <motion.div key="dashboard" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
               <Dashboard />
+            </motion.div>
+          )}
+
+          {activeTab === 'trends' && (
+            <motion.div key="trends" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
+              <TrendsTab />
+            </motion.div>
+          )}
+
+          {activeTab === 'entropyCalc' && (
+            <motion.div key="entropyCalc" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
+              <EntropyCalculator />
+            </motion.div>
+          )}
+
+          {activeTab === 'monitor' && (
+            <motion.div key="monitor" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
+              <BreachMonitor />
+            </motion.div>
+          )}
+
+          {activeTab === 'breachMap' && (
+            <motion.div key="breachMap" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
+              <BreachMap />
+            </motion.div>
+          )}
+
+          {activeTab === 'darkweb' && (
+            <motion.div key="darkweb" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
+              <DarkWebMonitor />
+            </motion.div>
+          )}
+
+          {activeTab === 'exportAnalyzer' && (
+            <motion.div key="exportAnalyzer" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
+              <ExportAnalyzer />
+            </motion.div>
+          )}
+
+          {activeTab === 'teams' && (
+            <motion.div key="teams" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
+              <TeamDashboard />
+            </motion.div>
+          )}
+
+          {activeTab === 'expiryTracker' && (
+            <motion.div key="expiryTracker" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
+              <ExpiryTracker />
+            </motion.div>
+          )}
+
+          {activeTab === 'gamification' && (
+            <motion.div key="gamification" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}>
+              <Gamification />
             </motion.div>
           )}
 
@@ -235,7 +309,7 @@ export default function App() {
         {/* Footer */}
         <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.6 }}
           className={`text-center text-xs pt-4 ${isDark ? 'text-slate-700' : 'text-slate-300'}`}>
-          {t('footer.text')}
+          Passwords are analyzed locally and never stored. History saves only strength metrics.
         </motion.p>
       </div>
     </div>

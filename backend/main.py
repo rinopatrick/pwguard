@@ -1,31 +1,34 @@
 """Password Strength Visualizer — FastAPI backend.
 Features: analyze, generate, passphrase, compare, report, policies, HIBP breach check,
-bulk analyze, QR code, API key auth, rate limiting.
+bulk analyze, QR code, API key auth, rate limiting, breach monitoring, suggestions,
+dark web check, export analysis.
 """
 
 import csv
+import hashlib
 import html
 import io
 import math
 import secrets
 import string
 import time
+import threading
 from collections import defaultdict
 from typing import Optional
 
-from fastapi import FastAPI, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import Column, Integer, String, DateTime, create_engine, func
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, Text, Float, create_engine, func
 from sqlalchemy.orm import declarative_base, sessionmaker
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from analyzer import analyze, POLICIES
+from analyzer import analyze, POLICIES, check_hibp_breach
 from wordlist import WORDS as EN_WORDS
 from wordlist_id import WORDS as ID_WORDS
 
-# ── Database (API Keys) ─────────────────────────────────────────────────
+# ── Database ─────────────────────────────────────────────────────────────
 
 DATABASE_URL = "sqlite:///./pwguard.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -41,7 +44,71 @@ class ApiKey(Base):
     request_count = Column(Integer, default=0)
 
 
+class BreachMonitor(Base):
+    __tablename__ = "breach_monitors"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String(255), unique=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_checked = Column(DateTime, nullable=True)
+    breach_count = Column(Integer, default=0)
+    breach_details = Column(Text, default="")
+    notified = Column(Boolean, default=False)
+
+
+class Team(Base):
+    __tablename__ = "teams"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+    policy_name = Column(String(50), default="Basic")
+
+
+class TeamMember(Base):
+    __tablename__ = "team_members"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    team_id = Column(Integer)
+    name = Column(String(200))
+    role = Column(String(20), default="member")  # admin/member
+    avg_strength = Column(Float, default=0.0)
+    breach_exposed = Column(Boolean, default=False)
+    added_at = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(bind=engine)
+
+# ── Background Breach Monitor ────────────────────────────────────────────
+
+def _check_monitored_emails():
+    """Background task: check all monitored emails against HIBP."""
+    while True:
+        time.sleep(3600)  # every hour
+        try:
+            db = SessionLocal()
+            monitors = db.query(BreachMonitor).all()
+            for m in monitors:
+                try:
+                    import urllib.request
+                    url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{m.email}"
+                    req = urllib.request.Request(url, headers={"User-Agent": "PWGuard/1.0", "hibp-api-key": ""})
+                    try:
+                        resp = urllib.request.urlopen(req, timeout=5)
+                        breaches = resp.read().decode()
+                        import json
+                        breach_list = json.loads(breaches) if breaches.strip() else []
+                        m.breach_count = len(breach_list)
+                        m.breach_details = json.dumps([b.get("Name", "") for b in breach_list[:10]])
+                    except Exception:
+                        pass  # 404 = no breaches, or API key needed
+                    m.last_checked = datetime.utcnow()
+                    db.commit()
+                except Exception:
+                    pass
+            db.close()
+        except Exception:
+            pass
+
+_bg_thread = threading.Thread(target=_check_monitored_emails, daemon=True)
+_bg_thread.start()
 
 app = FastAPI(title="Password Strength Visualizer API")
 
@@ -543,6 +610,34 @@ def generate_qr(req: QRRequest):
     return Response(content=svg, media_type="image/svg+xml")
 
 
+# ── Recent Breaches ──────────────────────────────────────────────────────
+
+_breaches_cache = {"data": None, "ts": 0}
+
+@app.get("/api/breaches/recent")
+def get_recent_breaches():
+    import json
+    now = time.time()
+    if _breaches_cache["data"] and now - _breaches_cache["ts"] < 3600:
+        return _breaches_cache["data"]
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://haveibeenpwned.com/api/v3/breaches",
+            headers={"User-Agent": "PWGuard/1.0"},
+        )
+        resp = urllib.request.urlopen(req, timeout=10)
+        breaches = json.loads(resp.read().decode("utf-8"))
+        # Sort by breach date, take most recent 50
+        breaches.sort(key=lambda b: b.get("BreachDate", ""), reverse=True)
+        result = breaches[:50]
+        _breaches_cache["data"] = result
+        _breaches_cache["ts"] = now
+        return result
+    except Exception:
+        return []
+
+
 # ── API Keys ─────────────────────────────────────────────────────────────
 
 @app.post("/api/keys/create")
@@ -568,3 +663,414 @@ def get_key_stats(key: str):
         "created_at": api_key.created_at.isoformat(),
         "request_count": api_key.request_count,
     }
+
+
+# ── Breach Monitoring ────────────────────────────────────────────────────
+
+class MonitorRequest(BaseModel):
+    email: str
+
+
+class MonitorResponse(BaseModel):
+    email: str
+    breach_count: int
+    breach_details: list[str]
+    last_checked: Optional[str]
+    created_at: str
+
+
+@app.post("/api/monitor", response_model=MonitorResponse)
+def add_monitor(req: MonitorRequest):
+    db = SessionLocal()
+    existing = db.query(BreachMonitor).filter(BreachMonitor.email == req.email).first()
+    if existing:
+        db.close()
+        raise HTTPException(status_code=409, detail="Email already monitored")
+
+    # Check HIBP immediately
+    breach_count = 0
+    breach_details = []
+    try:
+        import urllib.request
+        url = f"https://haveibeenpwned.com/api/v3/breachedaccount/{req.email}"
+        request = urllib.request.Request(url, headers={"User-Agent": "PWGuard/1.0"})
+        try:
+            resp = urllib.request.urlopen(request, timeout=5)
+            import json
+            breach_list = json.loads(resp.read().decode())
+            breach_count = len(breach_list)
+            breach_details = [b.get("Name", "") for b in breach_list[:10]]
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                breach_count = 0
+    except Exception:
+        pass
+
+    monitor = BreachMonitor(
+        email=req.email,
+        breach_count=breach_count,
+        breach_details=json.dumps(breach_details) if breach_details else "[]",
+        last_checked=datetime.utcnow(),
+    )
+    db.add(monitor)
+    db.commit()
+    db.close()
+
+    return MonitorResponse(
+        email=req.email,
+        breach_count=breach_count,
+        breach_details=breach_details,
+        last_checked=datetime.utcnow().isoformat(),
+        created_at=datetime.utcnow().isoformat(),
+    )
+
+
+@app.get("/api/monitor/{email}", response_model=MonitorResponse)
+def check_monitor(email: str):
+    db = SessionLocal()
+    m = db.query(BreachMonitor).filter(BreachMonitor.email == email).first()
+    db.close()
+    if not m:
+        raise HTTPException(status_code=404, detail="Email not monitored")
+    import json
+    details = json.loads(m.breach_details) if m.breach_details else []
+    return MonitorResponse(
+        email=m.email,
+        breach_count=m.breach_count,
+        breach_details=details,
+        last_checked=m.last_checked.isoformat() if m.last_checked else None,
+        created_at=m.created_at.isoformat(),
+    )
+
+
+@app.delete("/api/monitor/{email}")
+def delete_monitor(email: str):
+    db = SessionLocal()
+    m = db.query(BreachMonitor).filter(BreachMonitor.email == email).first()
+    if not m:
+        db.close()
+        raise HTTPException(status_code=404, detail="Email not monitored")
+    db.delete(m)
+    db.commit()
+    db.close()
+    return {"detail": "Deleted"}
+
+
+@app.get("/api/monitor")
+def list_monitors():
+    db = SessionLocal()
+    monitors = db.query(BreachMonitor).all()
+    db.close()
+    import json
+    return [
+        {
+            "email": m.email,
+            "breach_count": m.breach_count,
+            "breach_details": json.loads(m.breach_details) if m.breach_details else [],
+            "last_checked": m.last_checked.isoformat() if m.last_checked else None,
+            "created_at": m.created_at.isoformat(),
+        }
+        for m in monitors
+    ]
+
+
+# ── AI Password Suggestions ──────────────────────────────────────────────
+
+class SuggestRequest(BaseModel):
+    password: str
+
+
+class Suggestion(BaseModel):
+    password: str
+    reason: str
+    strength_label: str
+    strength_percent: int
+    entropy: float
+
+
+class SuggestResponse(BaseModel):
+    suggestions: list[Suggestion]
+
+
+@app.post("/api/suggest", response_model=SuggestResponse)
+def suggest_passwords(req: SuggestRequest):
+    client_ip = "default"
+    result = analyze(req.password, client_ip=client_ip)
+    suggestions = []
+
+    # Strategy 1: If too short, suggest longer version
+    if result.password_length < 12:
+        gen_req = GenerateRequest(length=max(16, result.password_length + 8))
+        gen = generate_password(gen_req)
+        suggestions.append(Suggestion(
+            password=gen.password,
+            reason=f"Longer ({gen_req.length} chars vs {result.password_length})",
+            strength_label=gen.strength_label,
+            strength_percent=gen.strength_percent,
+            entropy=gen.entropy,
+        ))
+
+    # Strategy 2: If no symbols, suggest with symbols
+    if not any(c in "!@#$%^&*" for c in req.password):
+        gen_req = GenerateRequest(length=max(16, result.password_length), include_symbols=True)
+        gen = generate_password(gen_req)
+        suggestions.append(Suggestion(
+            password=gen.password,
+            reason="Includes special characters for higher entropy",
+            strength_label=gen.strength_label,
+            strength_percent=gen.strength_percent,
+            entropy=gen.entropy,
+        ))
+
+    # Strategy 3: Suggest a passphrase
+    pp_req = PassphraseRequest(word_count=4, separator="-", capitalize=True, include_number=True)
+    pp = generate_passphrase(pp_req)
+    suggestions.append(Suggestion(
+        password=pp.passphrase,
+        reason="Passphrase: easy to remember, hard to crack",
+        strength_label=pp.strength_label,
+        strength_percent=pp.strength_percent,
+        entropy=pp.entropy,
+    ))
+
+    # Strategy 4: If breached, suggest completely different
+    if result.breach_count > 0:
+        gen_req = GenerateRequest(length=20, include_symbols=True)
+        gen = generate_password(gen_req)
+        suggestions.append(Suggestion(
+            password=gen.password,
+            reason=f"Your password was found in {result.breach_count:,} breaches — use a completely new one",
+            strength_label=gen.strength_label,
+            strength_percent=gen.strength_percent,
+            entropy=gen.entropy,
+        ))
+
+    return SuggestResponse(suggestions=suggestions[:3])
+
+
+# ── Dark Web Monitoring ──────────────────────────────────────────────────
+
+class DarkWebRequest(BaseModel):
+    domain: str
+
+
+class DarkWebBreach(BaseModel):
+    name: str
+    domain: str
+    breach_date: str
+    pwn_count: int
+    data_classes: list[str]
+    is_verified: bool
+
+
+class DarkWebResponse(BaseModel):
+    domain: str
+    breaches: list[DarkWebBreach]
+    total_breaches: int
+    total_accounts: int
+
+
+@app.post("/api/darkweb/check", response_model=DarkWebResponse)
+def check_dark_web(req: DarkWebRequest):
+    try:
+        import urllib.request
+        import json
+        url = f"https://haveibeenpwned.com/api/v3/breaches"
+        request = urllib.request.Request(url, headers={"User-Agent": "PWGuard/1.0"})
+        resp = urllib.request.urlopen(request, timeout=10)
+        all_breaches = json.loads(resp.read().decode())
+
+        matching = []
+        for b in all_breaches:
+            if req.domain.lower() in (b.get("Domain", "") or "").lower():
+                matching.append(DarkWebBreach(
+                    name=b.get("Name", ""),
+                    domain=b.get("Domain", ""),
+                    breach_date=b.get("BreachDate", ""),
+                    pwn_count=b.get("PwnCount", 0),
+                    data_classes=b.get("DataClasses", []),
+                    is_verified=b.get("IsVerified", False),
+                ))
+
+        total_accounts = sum(b.pwn_count for b in matching)
+        return DarkWebResponse(
+            domain=req.domain,
+            breaches=matching[:50],
+            total_breaches=len(matching),
+            total_accounts=total_accounts,
+        )
+    except Exception as e:
+        return DarkWebResponse(domain=req.domain, breaches=[], total_breaches=0, total_accounts=0)
+
+
+# ── Password Manager Export Analysis ─────────────────────────────────────
+
+@app.post("/api/analyze-export")
+def analyze_export(request: Request, file: UploadFile = File(...), format: str = "generic"):
+    content = file.file.read().decode("utf-8")
+    client_ip = request.client.host if request.client else "default"
+
+    # Parse based on format
+    entries = []
+    reader = csv.reader(io.StringIO(content))
+    header = next(reader, None)
+
+    for row in reader:
+        if not row:
+            continue
+        if format == "bitwarden" and len(row) >= 5:
+            # name,url,username,password,notes
+            entries.append({"name": row[0], "url": row[1], "username": row[2], "password": row[3]})
+        elif format == "1password" and len(row) >= 4:
+            entries.append({"name": row[0], "url": row[1], "username": row[2], "password": row[3]})
+        elif format == "lastpass" and len(row) >= 6:
+            entries.append({"name": row[0], "url": row[1], "username": row[2], "password": row[5]})
+        else:  # generic
+            pw = row[-1] if row else ""
+            name = row[0] if len(row) > 1 else "Unknown"
+            entries.append({"name": name, "url": "", "username": "", "password": pw})
+
+    results = []
+    weak = strong = breached = 0
+    total_entropy = 0.0
+
+    for entry in entries[:500]:
+        pw = entry["password"]
+        if not pw:
+            continue
+        result = analyze(pw, client_ip=client_ip)
+        hidden_user = entry["username"][:2] + "***" if len(entry["username"]) > 2 else "***"
+        results.append({
+            "name": entry["name"],
+            "url": entry["url"],
+            "username_hidden": hidden_user,
+            "analysis": {
+                "password_length": result.password_length,
+                "entropy": result.entropy,
+                "strength_percent": result.strength_percent,
+                "strength_label": result.strength_label,
+                "breach_count": result.breach_count,
+                "zxcvbn_score": result.zxcvbn_score,
+            },
+        })
+        total_entropy += result.entropy
+        if result.strength_percent < 40:
+            weak += 1
+        elif result.strength_percent >= 75:
+            strong += 1
+        if result.breach_count > 0:
+            breached += 1
+
+    return {
+        "results": results,
+        "summary": {
+            "total": len(results),
+            "weak_count": weak,
+            "strong_count": strong,
+            "breached_count": breached,
+            "avg_entropy": round(total_entropy / max(len(results), 1), 2),
+        },
+    }
+
+
+# ── Teams ────────────────────────────────────────────────────────────────
+
+class TeamCreateRequest(BaseModel):
+    name: str
+
+
+class TeamMemberRequest(BaseModel):
+    name: str
+    role: str = "member"
+
+
+class TeamPolicyRequest(BaseModel):
+    policy_name: str
+
+
+@app.post("/api/teams")
+def create_team(req: TeamCreateRequest):
+    db = SessionLocal()
+    team = Team(name=req.name)
+    db.add(team)
+    db.commit()
+    db.refresh(team)
+    db.close()
+    return {"id": team.id, "name": team.name, "policy_name": team.policy_name, "created_at": team.created_at.isoformat()}
+
+
+@app.get("/api/teams")
+def list_teams():
+    db = SessionLocal()
+    teams = db.query(Team).all()
+    result = []
+    for t in teams:
+        members = db.query(TeamMember).filter(TeamMember.team_id == t.id).all()
+        result.append({
+            "id": t.id,
+            "name": t.name,
+            "policy_name": t.policy_name,
+            "member_count": len(members),
+            "created_at": t.created_at.isoformat(),
+        })
+    db.close()
+    return result
+
+
+@app.post("/api/teams/{team_id}/members")
+def add_team_member(team_id: int, req: TeamMemberRequest):
+    db = SessionLocal()
+    team = db.query(Team).filter(Team.id == team_id).first()
+    if not team:
+        db.close()
+        raise HTTPException(status_code=404, detail="Team not found")
+    member = TeamMember(team_id=team_id, name=req.name, role=req.role)
+    db.add(member)
+    db.commit()
+    db.close()
+    return {"id": member.id, "name": req.name, "role": req.role}
+
+
+@app.get("/api/teams/{team_id}/members")
+def get_team_members(team_id: int):
+    db = SessionLocal()
+    members = db.query(TeamMember).filter(TeamMember.team_id == team_id).all()
+    db.close()
+    return [
+        {
+            "id": m.id,
+            "name": m.name,
+            "role": m.role,
+            "avg_strength": m.avg_strength,
+            "breach_exposed": m.breach_exposed,
+            "added_at": m.added_at.isoformat(),
+        }
+        for m in members
+    ]
+
+
+@app.post("/api/teams/{team_id}/policy")
+def set_team_policy(team_id: int, req: TeamPolicyRequest):
+    db = SessionLocal()
+    team = db.query(Team).filter(Team.id == team_id).first()
+    if not team:
+        db.close()
+        raise HTTPException(status_code=404, detail="Team not found")
+    team.policy_name = req.policy_name
+    db.commit()
+    db.close()
+    return {"id": team.id, "policy_name": team.policy_name}
+
+
+@app.delete("/api/teams/{team_id}")
+def delete_team(team_id: int):
+    db = SessionLocal()
+    team = db.query(Team).filter(Team.id == team_id).first()
+    if not team:
+        db.close()
+        raise HTTPException(status_code=404, detail="Team not found")
+    db.query(TeamMember).filter(TeamMember.team_id == team_id).delete()
+    db.delete(team)
+    db.commit()
+    db.close()
+    return {"detail": "Deleted"}
