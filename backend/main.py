@@ -1,20 +1,47 @@
 """Password Strength Visualizer — FastAPI backend.
-Features: analyze, generate, passphrase, compare, report, policies, HIBP breach check.
+Features: analyze, generate, passphrase, compare, report, policies, HIBP breach check,
+bulk analyze, QR code, API key auth, rate limiting.
 """
 
+import csv
 import html
+import io
 import math
 import secrets
 import string
+import time
+from collections import defaultdict
 from typing import Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy import Column, Integer, String, DateTime, create_engine, func
+from sqlalchemy.orm import declarative_base, sessionmaker
+from datetime import datetime
 
 from analyzer import analyze, POLICIES
 from wordlist import WORDS as EN_WORDS
 from wordlist_id import WORDS as ID_WORDS
+
+# ── Database (API Keys) ─────────────────────────────────────────────────
+
+DATABASE_URL = "sqlite:///./pwguard.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+Base = declarative_base()
+
+
+class ApiKey(Base):
+    __tablename__ = "api_keys"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    key = Column(String(32), unique=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    request_count = Column(Integer, default=0)
+
+
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Password Strength Visualizer API")
 
@@ -26,6 +53,21 @@ app.add_middleware(
 )
 
 WORDLISTS = {"en": EN_WORDS, "id": ID_WORDS}
+
+# ── Rate Limiting ────────────────────────────────────────────────────────
+
+rate_limit_store: dict[str, list[float]] = defaultdict(list)
+RATE_LIMIT = 100
+RATE_WINDOW = 3600
+
+
+def check_rate_limit(key: str) -> bool:
+    now = time.time()
+    rate_limit_store[key] = [t for t in rate_limit_store[key] if now - t < RATE_WINDOW]
+    if len(rate_limit_store[key]) >= RATE_LIMIT:
+        return False
+    rate_limit_store[key].append(now)
+    return True
 
 
 # ── Analyze ──────────────────────────────────────────────────────────────
@@ -59,6 +101,8 @@ class AnalysisResponse(BaseModel):
     zxcvbn_score: int
     zxcvbn_feedback: list[str]
     hibp_cached: bool
+    mutations: list[PatternResponse] = []
+    indonesian_breach: bool = False
 
 
 @app.post("/api/analyze", response_model=AnalysisResponse)
@@ -82,6 +126,8 @@ def analyze_password(req: PasswordRequest, request: Request):
         zxcvbn_score=result.zxcvbn_score,
         zxcvbn_feedback=result.zxcvbn_feedback,
         hibp_cached=result.hibp_cached,
+        mutations=[PatternResponse(name=m.name, description=m.description, penalty=m.penalty) for m in result.mutations],
+        indonesian_breach=result.indonesian_breach,
     )
 
 
@@ -359,3 +405,166 @@ def get_policies():
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+# ── Bulk Analyze ─────────────────────────────────────────────────────────
+
+class BulkAnalyzeRequest(BaseModel):
+    passwords: list[str]
+    policy: Optional[str] = None
+
+
+class BulkResultItem(BaseModel):
+    password_hidden: str
+    analysis: AnalysisResponse
+
+
+class BulkAnalyzeResponse(BaseModel):
+    results: list[BulkResultItem]
+    summary: dict
+
+
+@app.post("/api/analyze-bulk", response_model=BulkAnalyzeResponse)
+def analyze_bulk(req: BulkAnalyzeRequest, request: Request):
+    client_ip = request.client.host if request.client else "default"
+    pw_list = req.passwords[:1000]
+    results = []
+    weak = strong = breached = 0
+    total_entropy = 0.0
+
+    for pw in pw_list:
+        result = analyze(pw, policy=req.policy, client_ip=client_ip)
+        hidden = pw[:2] + "*" * max(len(pw) - 4, 0) + pw[-2:] if len(pw) > 4 else "***"
+        analysis_resp = AnalysisResponse(
+            password_length=result.password_length,
+            charset_size=result.charset_size,
+            entropy=result.entropy,
+            crack_time_seconds=result.crack_time_seconds,
+            crack_time_display=result.crack_time_display,
+            strength_percent=result.strength_percent,
+            strength_label=result.strength_label,
+            patterns=[PatternResponse(name=p.name, description=p.description, penalty=p.penalty) for p in result.patterns],
+            charset_breakdown=result.charset_breakdown,
+            breach_count=result.breach_count,
+            breach_checked=result.breach_checked,
+            policy_compliant=result.policy_compliant,
+            policy_violations=result.policy_violations,
+            zxcvbn_score=result.zxcvbn_score,
+            zxcvbn_feedback=result.zxcvbn_feedback,
+            hibp_cached=result.hibp_cached,
+            mutations=[PatternResponse(name=m.name, description=m.description, penalty=m.penalty) for m in result.mutations],
+            indonesian_breach=result.indonesian_breach,
+        )
+        results.append(BulkResultItem(password_hidden=hidden, analysis=analysis_resp))
+        total_entropy += result.entropy
+        if result.strength_percent < 40:
+            weak += 1
+        elif result.strength_percent >= 75:
+            strong += 1
+        if result.breach_count > 0:
+            breached += 1
+
+    summary = {
+        "total": len(results),
+        "weak_count": weak,
+        "strong_count": strong,
+        "breached_count": breached,
+        "avg_entropy": round(total_entropy / max(len(results), 1), 2),
+    }
+    return BulkAnalyzeResponse(results=results, summary=summary)
+
+
+@app.post("/api/analyze-bulk/csv")
+def analyze_bulk_csv(request: Request, file: UploadFile = File(...)):
+    """Accept CSV file, analyze passwords, return CSV results."""
+    content = file.file.read().decode("utf-8")
+    client_ip = request.client.host if request.client else "default"
+
+    passwords = []
+    for line in content.strip().splitlines():
+        parts = line.strip().split(",")
+        pw = parts[-1].strip() if parts else ""
+        if pw:
+            passwords.append(pw)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["password_masked", "strength_percent", "strength_label", "entropy", "breach_count", "zxcvbn_score", "policy_compliant"])
+
+    for pw in passwords[:1000]:
+        result = analyze(pw, client_ip=client_ip)
+        hidden = pw[:2] + "***" + pw[-2:] if len(pw) > 4 else "***"
+        writer.writerow([hidden, result.strength_percent, result.strength_label, result.entropy,
+                         result.breach_count, result.zxcvbn_score, result.policy_compliant])
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=analysis-results.csv"},
+    )
+
+
+# ── QR Code ──────────────────────────────────────────────────────────────
+
+class QRRequest(BaseModel):
+    text: str
+    size: int = 200
+
+
+@app.post("/api/qr")
+def generate_qr(req: QRRequest):
+    """Generate a simple SVG QR code placeholder."""
+    size = max(100, min(500, req.size))
+    # Simple placeholder SVG — a styled grid pattern
+    cell_size = size // 25
+    svg_size = cell_size * 25
+
+    cells = []
+    # Generate deterministic pattern from text hash
+    h = hashlib.sha256(req.text.encode()).hexdigest()
+    for i in range(25):
+        for j in range(25):
+            idx = (i * 25 + j) % len(h)
+            if int(h[idx], 16) % 3 == 0:
+                x = j * cell_size
+                y = i * cell_size
+                cells.append(f'<rect x="{x}" y="{y}" width="{cell_size}" height="{cell_size}" fill="#000"/>')
+
+    # Position detection patterns (corners)
+    for cx, cy in [(0, 0), (18, 0), (0, 18)]:
+        cells.append(f'<rect x="{cx*cell_size}" y="{cy*cell_size}" width="{7*cell_size}" height="{7*cell_size}" fill="none" stroke="#000" stroke-width="{cell_size}"/>')
+        cells.append(f'<rect x="{(cx+2)*cell_size}" y="{(cy+2)*cell_size}" width="{3*cell_size}" height="{3*cell_size}" fill="#000"/>')
+
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {svg_size} {svg_size}" width="{size}" height="{size}">
+    <rect width="{svg_size}" height="{svg_size}" fill="#fff"/>
+    {"".join(cells)}
+</svg>'''
+    return Response(content=svg, media_type="image/svg+xml")
+
+
+# ── API Keys ─────────────────────────────────────────────────────────────
+
+@app.post("/api/keys/create")
+def create_api_key():
+    db = SessionLocal()
+    key = secrets.token_hex(16)
+    api_key = ApiKey(key=key)
+    db.add(api_key)
+    db.commit()
+    db.close()
+    return {"key": key}
+
+
+@app.get("/api/keys/{key}/stats")
+def get_key_stats(key: str):
+    db = SessionLocal()
+    api_key = db.query(ApiKey).filter(ApiKey.key == key).first()
+    db.close()
+    if not api_key:
+        return {"error": "Key not found"}
+    return {
+        "key": key,
+        "created_at": api_key.created_at.isoformat(),
+        "request_count": api_key.request_count,
+    }

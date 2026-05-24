@@ -195,6 +195,32 @@ export default function AnalysisPanel({ result }: Props) {
         </motion.div>
       )}
 
+      {/* Mutations */}
+      {result.mutations && result.mutations.length > 0 && (
+        <motion.div variants={item} className="p-5 rounded-xl bg-orange-500/10 border border-orange-500/20">
+          <div className="flex items-center gap-3 mb-3">
+            <span className="text-2xl">🧬</span>
+            <p className="text-orange-300 font-bold">Password mutations detected</p>
+          </div>
+          {result.mutations.map((m, i) => (
+            <p key={i} className="text-xs text-orange-300/80 ml-10">→ {m.description}</p>
+          ))}
+        </motion.div>
+      )}
+
+      {/* Indonesian breach */}
+      {result.indonesian_breach && (
+        <motion.div variants={item} className="p-5 rounded-xl bg-red-500/10 border border-red-500/20">
+          <div className="flex items-center gap-3">
+            <span className="text-2xl">🇮🇩</span>
+            <div>
+              <p className="text-red-300 font-bold">Found in Indonesian breach database</p>
+              <p className="text-xs text-red-400/80 mt-1">This password appears in a local database of commonly breached Indonesian passwords.</p>
+            </div>
+          </div>
+        </motion.div>
+      )}
+
       {/* Export Report */}
       <motion.div variants={item}>
         <ReportExport />

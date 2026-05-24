@@ -1,7 +1,8 @@
-"""Password strength analysis engine with entropy, patterns, HIBP breach check, policy rules, forbidden words, zxcvbn scoring, and multi-layout keyboard detection."""
+"""Password strength analysis engine with entropy, patterns, HIBP breach check, policy rules, forbidden words, zxcvbn scoring, multi-layout keyboard detection, mutation analysis, and Indonesian breach database."""
 
 import hashlib
 import math
+import os
 import re
 import time
 import urllib.request
@@ -81,6 +82,19 @@ COMMON_PASSWORDS = {
 
 LEET_MAP = {"4": "a", "@": "a", "3": "e", "1": "i", "!": "i", "0": "o", "5": "s", "$": "s", "7": "t", "+": "t"}
 
+# ── Indonesian Breach Database ───────────────────────────────────────────
+
+_INDONESIAN_BREACHES: set[str] = set()
+_indonesian_breach_file = os.path.join(os.path.dirname(__file__), "indonesian_breaches.txt")
+try:
+    with open(_indonesian_breach_file) as f:
+        for line in f:
+            w = line.strip().lower()
+            if w:
+                _INDONESIAN_BREACHES.add(w)
+except FileNotFoundError:
+    pass
+
 # ── Strength Policies ────────────────────────────────────────────────────
 
 POLICIES = {
@@ -136,6 +150,8 @@ class AnalysisResult:
     zxcvbn_score: int = 0
     zxcvbn_feedback: list[str] = field(default_factory=list)
     hibp_cached: bool = False
+    mutations: list[Pattern] = field(default_factory=list)
+    indonesian_breach: bool = False
 
 
 # ── HIBP Check (with caching + rate limit + offline fallback) ─────────────
@@ -246,6 +262,63 @@ def format_crack_time(seconds: float) -> str:
     return "centuries+"
 
 
+# ── Mutation Detection ───────────────────────────────────────────────────
+
+def detect_mutations(password: str) -> list[Pattern]:
+    """Detect common password mutations based on known weak passwords."""
+    patterns = []
+    lower = password.lower()
+
+    # Build candidate set
+    candidates = COMMON_PASSWORDS | _INDONESIAN_BREACHES
+
+    # 1. Append number: password1, password123
+    stripped = re.sub(r'\d+$', '', lower)
+    if stripped != lower and stripped in candidates:
+        patterns.append(Pattern("mutation", f"Common mutation of '{stripped}' detected (number appended)", 25))
+
+    # 2. Capitalize first: Password, Qwerty
+    if lower[0:1].isalpha() and password[0].isupper() and password[1:] == password[1:].lower():
+        if lower in candidates:
+            patterns.append(Pattern("mutation", f"Common mutation of '{lower}' detected (first letter capitalized)", 20))
+
+    # 3. Leet speak: P@ssw0rd -> password, 1 -> i, 0 -> o
+    decoded = lower
+    for leet, orig in LEET_MAP.items():
+        decoded = decoded.replace(leet, orig)
+    if decoded != lower and decoded in candidates:
+        patterns.append(Pattern("mutation", f"Common mutation of '{decoded}' detected (leetspeak)", 20))
+
+    # 4. Reverse: drowssap -> password
+    reversed_pw = lower[::-1]
+    if reversed_pw in candidates:
+        patterns.append(Pattern("mutation", f"Common mutation of '{reversed_pw}' detected (reversed)", 25))
+
+    # 5. Double: passwordpassword
+    half = len(lower) // 2
+    if len(lower) >= 6 and lower[:half] == lower[half:2*half] and lower[:half] in candidates:
+        patterns.append(Pattern("mutation", f"Common mutation of '{lower[:half]}' detected (doubled)", 25))
+
+    # 6. Suffix mutation: password!, password@, password#
+    if re.search(r'[!@#$%^&*()_+\-=\[\]{}|;:\'",.<>?/\\]+$', lower):
+        base = re.sub(r'[!@#$%^&*()_+\-=\[\]{}|;:\'",.<>?/\\]+$', '', lower)
+        if base in candidates:
+            patterns.append(Pattern("mutation", f"Common mutation of '{base}' detected (symbol suffix)", 20))
+
+    # 7. Prefix mutation: !password, 123password
+    if re.search(r'^[!@#$%^&*()_+\-=\[\]{}|;:\'",.<>?/\\]+', lower):
+        base = re.sub(r'^[!@#$%^&*()_+\-=\[\]{}|;:\'",.<>?/\\]+', '', lower)
+        if base in candidates:
+            patterns.append(Pattern("mutation", f"Common mutation of '{base}' detected (symbol prefix)", 20))
+
+    if re.search(r'^\d+', lower):
+        base = re.sub(r'^\d+', '', lower)
+        if base in candidates:
+            patterns.append(Pattern("mutation", f"Common mutation of '{base}' detected (number prefix)", 20))
+
+    return patterns
+
+
 # ── Pattern Detection ────────────────────────────────────────────────────
 
 def detect_patterns(password: str, forbidden_words: Optional[list[str]] = None) -> list[Pattern]:
@@ -254,6 +327,10 @@ def detect_patterns(password: str, forbidden_words: Optional[list[str]] = None) 
 
     if lower in COMMON_PASSWORDS:
         patterns.append(Pattern("common_password", "This is a commonly used password", 30))
+
+    # Indonesian breach check
+    if lower in _INDONESIAN_BREACHES:
+        patterns.append(Pattern("indonesian_breach", "Found in Indonesian breach database", 35))
 
     for seq in ALL_KEYBOARD_SEQUENCES:
         if seq in lower or seq[::-1] in lower:
@@ -349,6 +426,14 @@ def analyze(password: str, policy: Optional[str] = None, forbidden_words: Option
     entropy = calculate_entropy(password, charset_size)
     patterns = detect_patterns(password, forbidden_words)
 
+    # Mutation detection
+    mutations = detect_mutations(password)
+    for m in mutations:
+        patterns.append(m)
+
+    # Indonesian breach check
+    indonesian_breach = password.lower() in _INDONESIAN_BREACHES
+
     # Apply pattern penalties
     penalty = sum(p.penalty for p in patterns)
     effective_entropy = max(entropy - penalty, 0)
@@ -414,4 +499,6 @@ def analyze(password: str, policy: Optional[str] = None, forbidden_words: Option
         zxcvbn_score=zx_result["score"],
         zxcvbn_feedback=zx_result["feedback"],
         hibp_cached=hibp_cached,
+        mutations=mutations,
+        indonesian_breach=indonesian_breach,
     )

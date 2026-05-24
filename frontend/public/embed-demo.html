@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PWGuard Widget Demo</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 500px; margin: 60px auto; padding: 20px; background: #0f172a; color: #e2e8f0; }
+    h1 { color: #818cf8; font-size: 24px; }
+    .form-group { margin: 20px 0; }
+    label { display: block; font-size: 14px; color: #94a3b8; margin-bottom: 6px; }
+    input { width: 100%; padding: 12px 16px; background: #1e293b; border: 1px solid #334155; border-radius: 8px; color: white; font-size: 16px; outline: none; }
+    input:focus { border-color: #6366f1; }
+    .info { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; margin: 30px 0; font-size: 14px; }
+    code { background: #334155; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>PWGuard Widget Demo</h1>
+  <p style="color:#94a3b8">This page demonstrates the embeddable password strength widget.</p>
+
+  <form>
+    <div class="form-group">
+      <label>Username</label>
+      <input type="text" placeholder="Enter username">
+    </div>
+    <div class="form-group">
+      <label>Password</label>
+      <input type="password" placeholder="Enter password">
+    </div>
+    <div class="form-group">
+      <label>Confirm Password</label>
+      <input type="password" placeholder="Confirm password">
+    </div>
+  </form>
+
+  <div class="info">
+    <h3 style="margin-top:0">How to embed</h3>
+    <p>Add this single line before <code>&lt;/body&gt;</code>:</p>
+    <pre style="background:#0f172a;padding:12px;border-radius:8px;overflow-x:auto"><code>&lt;script src="https://your-domain.com/widget.js"
+  data-api-url="https://your-domain.com"
+  data-theme="dark"
+  data-position="below"&gt;&lt;/script&gt;</code></pre>
+    <p style="margin-bottom:0"><strong>Options:</strong></p>
+    <ul style="padding-left:20px">
+      <li><code>data-api-url</code> — PWGuard server URL</li>
+      <li><code>data-theme</code> — <code>dark</code> or <code>light</code></li>
+      <li><code>data-position</code> — <code>below</code> or <code>inline</code></li>
+    </ul>
+  </div>
+
+  <script src="/widget.js" data-api-url="http://localhost:8001" data-theme="dark" data-position="below"></script>
+</body>
+</html>

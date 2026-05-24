@@ -17,6 +17,8 @@ export interface AnalysisResult {
   zxcvbn_score: number;
   zxcvbn_feedback: string[];
   hibp_cached: boolean;
+  mutations: { name: string; description: string; penalty: number }[];
+  indonesian_breach: boolean;
 }
 
 export function usePasswordAnalysis() {

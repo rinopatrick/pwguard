@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "PWGuard - Password Strength Checker",
+  "version": "1.0.0",
+  "description": "Adds a password strength meter to all password fields on any website.",
+  "permissions": ["activeTab"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "PWGuard"
+  },
+  "icons": {
+    "16": "icon.svg",
+    "48": "icon.svg",
+    "128": "icon.svg"
+  }
+}

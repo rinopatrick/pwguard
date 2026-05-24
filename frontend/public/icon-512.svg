@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#a855f7"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="100" fill="url(#bg)"/>
+  <g transform="translate(256,210)">
+    <path d="M0,-120 L95,-80 L95,30 Q95,95 0,135 Q-95,95 -95,30 L-95,-80 Z" fill="none" stroke="white" stroke-width="12"/>
+    <path d="M-40,15 L-8,50 L48,-25" fill="none" stroke="white" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="256" y="420" text-anchor="middle" fill="white" font-family="sans-serif" font-size="48" font-weight="bold">PWGuard</text>
+</svg>
