@@ -9,6 +9,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional
 
+from zxcvbn_lite import zxcvbn_score_password, _is_keyboard_walk, _is_sequence, _is_repeat, _is_date
+
 # ── HIBP Cache ───────────────────────────────────────────────────────────
 
 _hibp_cache: dict[str, tuple[float, list[tuple[str, int]]]] = {}  # prefix -> (timestamp, [(suffix, count)])
@@ -320,8 +322,33 @@ def detect_mutations(password: str) -> list[Pattern]:
 
 
 # ── Pattern Detection ────────────────────────────────────────────────────
+# NOTE: Keyboard walks, sequences, repeats, dates, and leetspeak are now
+# handled by zxcvbn_lite.py to avoid duplicate logic. This function handles
+# patterns unique to the analyzer (common passwords, Indonesian breaches,
+# forbidden words, charset-only patterns).
+
+ZXCVBN_PENALTY_MAP = {
+    "dictionary": 20,
+    "keyboard": 15,
+    "sequence": 10,
+    "repeat": 10,
+    "date": 8,
+    "short": 5,
+}
+
+ZXCVBN_DESC_MAP = {
+    "dictionary": "Contains dictionary word",
+    "keyboard": "Keyboard walk pattern detected",
+    "sequence": "Sequential characters (abc, 123, etc.)",
+    "repeat": "Repeating pattern detected",
+    "date": "Date pattern detected",
+    "short": "Password is too short",
+}
+
 
 def detect_patterns(password: str, forbidden_words: Optional[list[str]] = None) -> list[Pattern]:
+    """Detect patterns unique to analyzer.py. Keyboard/sequence/repeat/date/leetspeak
+    are handled by zxcvbn_lite and merged in analyze()."""
     patterns = []
     lower = password.lower()
 
@@ -331,28 +358,6 @@ def detect_patterns(password: str, forbidden_words: Optional[list[str]] = None) 
     # Indonesian breach check
     if lower in _INDONESIAN_BREACHES:
         patterns.append(Pattern("indonesian_breach", "Found in Indonesian breach database", 35))
-
-    for seq in ALL_KEYBOARD_SEQUENCES:
-        if seq in lower or seq[::-1] in lower:
-            layout = "QWERTY" if seq in KEYBOARD_SEQUENCES else ("Dvorak" if seq in DVORAK_SEQUENCES else "Colemak")
-            patterns.append(Pattern("keyboard_sequence", f"Contains {layout} keyboard sequence '{seq[:6]}...'", 15))
-            break
-
-    if re.search(r"(.)\1{2,}", password):
-        patterns.append(Pattern("repeated_chars", "Contains repeated characters (3+ in a row)", 10))
-
-    for i in range(len(password) - 2):
-        c1, c2, c3 = ord(password[i]), ord(password[i + 1]), ord(password[i + 2])
-        if c2 == c1 + 1 and c3 == c2 + 1 and (c1 in range(97, 123) or c1 in range(48, 58)):
-            patterns.append(Pattern("sequential_chars", "Contains sequential characters (abc, 123, etc.)", 10))
-            break
-
-    if re.search(r"(19[9]\d|20[0-2]\d)", password):
-        patterns.append(Pattern("date_pattern", "Contains what looks like a year/date", 8))
-
-    leet_count = sum(1 for c in password if c in LEET_MAP)
-    if leet_count > len(password) * 0.4 and leet_count > 2:
-        patterns.append(Pattern("leetspeak", "Uses common leetspeak substitutions", 5))
 
     if len(set(password)) == 1 and len(password) > 1:
         patterns.append(Pattern("all_same", "All characters are the same", 35))
@@ -478,9 +483,31 @@ def analyze(password: str, policy: Optional[str] = None, forbidden_words: Option
         effective_breach = breach_count if breach_checked and breach_count > 0 else 0
         policy_compliant, policy_violations = check_policy(password, policy, effective_breach)
 
-    # zxcvbn-lite scoring
-    from zxcvbn_lite import zxcvbn_score_password
+    # zxcvbn-lite scoring — merge match patterns into our pattern list
     zx_result = zxcvbn_score_password(password)
+    for match in zx_result.get("matches", []):
+        match_type = match.get("type", "")
+        if match_type in ZXCVBN_PENALTY_MAP:
+            patterns.append(Pattern(
+                name=f"zxcvbn_{match_type}",
+                description=match.get("detail", ZXCVBN_DESC_MAP.get(match_type, "")),
+                penalty=ZXCVBN_PENALTY_MAP[match_type],
+            ))
+
+    # Recalculate effective entropy with zxcvbn patterns included
+    total_penalty = sum(p.penalty for p in patterns)
+    effective_entropy = max(entropy - total_penalty, 0)
+    strength_percent = min(int((effective_entropy / 128) * 100), 100)
+    if strength_percent < 20:
+        strength_label = "Very Weak"
+    elif strength_percent < 40:
+        strength_label = "Weak"
+    elif strength_percent < 60:
+        strength_label = "Fair"
+    elif strength_percent < 80:
+        strength_label = "Strong"
+    else:
+        strength_label = "Very Strong"
 
     return AnalysisResult(
         password_length=len(password),
